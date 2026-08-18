@@ -236,6 +236,12 @@ const resetCore = () => {
     model = "";
     register = [];
     firmware = "";
+    // NIBEPI_PATCHED_REGQUEUE: the replacement core starts with an empty poll list,
+    // but regQueue is parent state and survived. Without clearing it addRegular()
+    // treats every register as already added, never sends regRegister to the new
+    // core, and the repopulate path (regQueue.length===0 on the next 0x68 frame)
+    // can never fire — leaving the configured registers unpolled after a restart.
+    regQueue.length = 0;
 }
 const initiateCore = (host,port,cb) => {
     if(config.log===undefined) config.log = {};
@@ -431,7 +437,12 @@ const announcment = (msg,cb) => {
                 let data = Object.assign({}, atad);
                 if(data!==undefined && data.raw_data===251) {
                     console.log('Resetting alarm.')
-                    setData(45171,1);
+                    // NIBEPI_PATCHED_ALARM: the pump acts on a 0 -> 1 edge here.
+                    // Writing 1 onto a register that is already 1 does nothing, so
+                    // clear it first, otherwise only the first reset after a reboot
+                    // ever worked and the alarm stuck on the display afterwards.
+                    setData(45171,0);
+                    setTimeout(function() { setData(45171,1); }, 2000);
                 }
             }).catch(console.log)
         }
@@ -1200,6 +1211,19 @@ function startMQTT(host,port,user,pass) {
     mqtt_client.on('connect', function () {
         nibeEmit.emit('fault',{from:"MQTT",message:'MQTT Brokern är ansluten'});
         console.log("MQTT Broker is connected.")
+        // NIBEPI_PATCHED: the client connects with a clean session, so the broker
+        // throws the subscriptions away on every disconnect. The promise below
+        // resolves only on the first connect, so restore them here each time.
+        try {
+            if(config.mqtt!==undefined && config.mqtt.topic!==undefined) {
+                mqtt_client.subscribe(config.mqtt.topic+'#');
+            }
+            for (const arr of mqtt_subcribers) {
+                mqtt_client.subscribe(arr);
+            }
+        } catch(error) {
+            console.log('Could not restore MQTT subscriptions. '+error.message);
+        }
         resolve(mqtt_client);
     });
     mqtt_client.on('close',function(err){
@@ -1227,7 +1251,33 @@ async function addMQTTdiscovery(data) {
         if(i===-1 && j!==-1) {
             let result = await formatMQTTdiscovery(data)
             let topic = 'homeassistant/'+result.component+'/'+data.register+'/config'
-            let message = JSON.stringify({"name": "Nibe "+data.titel,"device_class":result.type,"unit_of_measurement":result.unit,"state_topic":result.topic});
+            // NIBEPI_PATCHED_DISCOVERY: unique_id lubab UI-st ymber nimetada,
+            // device koondab sensorid uhe seadme alla. object_id on KRIITILINE:
+            // ilma selleta prefiksib HA entity_id-d seadme nimega ja koik
+            // olemasolevad viited laheksid katki.
+            var _name = "Nibe " + data.titel;
+            var _objid = _name.toLowerCase()
+                              .replace(/[^a-z0-9]+/g, "_")
+                              .replace(/_+/g, "_")
+                              .replace(/^_|_$/g, "");
+            var _sys = config.system || {};
+            var _payload = {
+                "name": _name,
+                "unique_id": "nibepi_" + data.register,
+                "object_id": _objid,
+                "state_topic": result.topic,
+                "device": {
+                    "identifiers": ["SHK200S"],
+                    "manufacturer": "Novelan",
+                    "model": "L12 SPLIT",
+                    "name": "Novelan-L12-Split"
+                }
+            };
+            if(_sys.firmware) _payload.device.sw_version = String(_sys.firmware);
+            if(result.type !== undefined) _payload.device_class = result.type;
+            if(result.state_class !== undefined) _payload.state_class = result.state_class;
+            if(result.unit !== undefined) _payload.unit_of_measurement = result.unit;
+            let message = JSON.stringify(_payload);
             if(result.component!==undefined) {
                 publishMQTTpromise(topic,message,true).then(result => {
                     log(config.log.enable,`Adding MQTT Discovery object, register ${data.register}`,config.log['info'],"MQTT");
@@ -1265,19 +1315,39 @@ function formatMQTTdiscovery(data) {
         result.unit = data.unit;
         result.component = "sensor";
         result.topic = config.mqtt.topic+data.register;
-        if(result.unit=="°C") {
-            result.type = "temperature";
-        } else if(result.unit=="A") {
-            result.type = "power";
-        } else if(result.unit=="kW") {
-            result.type = "power";
-        } else if(result.unit=="Hz" || result.unit=="%") {
-            result.type = undefined;
-        } else if(result.unit=="") {
+        // NIBEPI_PATCHED_DISCOVERY: the original knew five units and mapped
+        // amperes to power. Without state_class Home Assistant kept no long
+        // term statistics, and kWh sensors never reached the Energy Dashboard.
+        var NIBE_UNIT_MAP = {
+            "°C":  { dc: "temperature",      sc: "measurement" },
+            "K":   { dc: "temperature",      sc: "measurement" },
+            "A":   { dc: "current",          sc: "measurement" },
+            "V":   { dc: "voltage",          sc: "measurement" },
+            "W":   { dc: "power",            sc: "measurement" },
+            "kW":  { dc: "power",            sc: "measurement" },
+            "Wh":  { dc: "energy",           sc: "total_increasing" },
+            "kWh": { dc: "energy",           sc: "total_increasing" },
+            "Hz":  { dc: "frequency",        sc: "measurement" },
+            "bar": { dc: "pressure",         sc: "measurement" },
+            "l/m": { dc: "volume_flow_rate", sc: "measurement", unit: "L/min" },
+            "h":   { dc: "duration",         sc: "total_increasing" },
+            "%":   { dc: undefined,          sc: "measurement" }
+        };
+        var _u = (result.unit === undefined || result.unit === null) ? "" : String(result.unit).trim();
+        var _m = NIBE_UNIT_MAP[_u];
+        if(_m !== undefined) {
+            result.type = _m.dc;
+            // Home Assistant ties the accepted units to the device_class:
+            // l/m is not valid for volume_flow_rate, the canonical one is L/min.
+            if(_m.unit !== undefined) result.unit = _m.unit;
+            result.state_class = _m.sc;
+        } else if(_u === "") {
             result.type = undefined;
             result.unit = undefined;
         } else {
-            
+            // Unknown unit: send the unit but leave the class off. A wrong
+            // device_class makes Home Assistant reject the entity outright.
+            result.type = undefined;
         }
         resolve(result)
     });

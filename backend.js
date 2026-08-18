@@ -30,7 +30,9 @@ exec(`sudo chrt -a -f -p 99 ${process.pid}`, function(error, stdout, stderr) {
     }
 
 });*/
-const serialport = require('serialport');
+// NIBEPI_PATCHED_SP13: serialport 13 exports a named SerialPort and takes
+// an options object; the old form was new serialport(port, baud).
+const { SerialPort } = require('serialport');
 const nack = [0x15];
 const ack = [0x06];
 var myPort;
@@ -51,11 +53,15 @@ process.on('message', (m) => {
     if(m.start===true) {
         if(m.port!==undefined) {
             portName = m.port;
-            myPort = new serialport(portName, 9600);
-            myPort.on('open', showPortOpen);
-            myPort.on('data', analyzeData);
-            myPort.on('close', showPortClose);
-            myPort.on('error', showError);
+            try {
+                myPort = new SerialPort({ path: portName, baudRate: 9600 });
+                myPort.on('open', showPortOpen);
+                myPort.on('data', analyzeData);
+                myPort.on('close', showPortClose);
+                myPort.on('error', showError);
+            } catch(error) {
+                coreFailed(error.message);
+            }
         } else {
             if(process.connected===true) {
                 process.send({type:"log",data:'Error starting backend, no serial port specified',level:"error",kind:"Serialport"});
@@ -95,19 +101,29 @@ process.on('message', (m) => {
 function showPortOpen() {
     //console.log(`Core started on serial port ${portName}`);
 }
+// NIBEPI_PATCHED: losing the USB adapter fires "close", not "error", and the old
+// close handler only logged it. No fault reached Node-RED, so the core kept
+// running against a dead port and the pump raised "Kom.avb Modbus" until the Pi
+// was rebooted. Both paths now report the fault once and exit, which is what
+// makes config_node.js fork a fresh core.
+var coreShuttingDown = false;
 function showPortClose() {
-    console.log('Port closed. Data rate: ' + myPort.baudRate);
+    coreFailed('port closed');
 }
 function showError(error) {
+    coreFailed(error && error.message ? error.message : 'serial port error');
+}
+function coreFailed(reason) {
+    if(coreShuttingDown===true) return;
+    coreShuttingDown = true;
+    console.log('Serial port lost (' + reason + '), shutting the core down so it gets restarted.');
+    try { myPort.removeAllListeners(); } catch(error) {}
     if(process.connected===true) {
-        process.send({type:"fault",data:{from:"core",message:"The core could not be started, check the serialport"}});
+        process.send({type:"fault",data:{from:"core",message:"Serial port lost: "+reason}});
     }
-    myPort.removeAllListeners();
-    if(process.connected===true) {
-        process.disconnect();
-        console.log('Error in the core, shuting it down.')
-        process.exit(99);
-    }
+    // Give the IPC message time to arrive before going away: it is the only
+    // thing that triggers the restart on the Node-RED side.
+    setTimeout(function() { process.exit(99); }, 500);
 }
 
 function analyzeData(data) {
