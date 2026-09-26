@@ -91,3 +91,23 @@ a single register added from the UI still reads at once.
 
 Measured after a restart: 0 timeouts in the first 75 s (was ~37), and RMU, indoor
 and forecast control all registered within 75 s without the watchdog having to act.
+
+## index.js — persistence under Docker
+
+**10. Settings and graphs were never written to disk in a container**
+(`NIBEPI_PATCHED_PERSIST`). `updateConfig()` only writes directly when `docker`
+is true; otherwise it first runs `sudo mount -o remount,rw /` and skips the write
+if that fails. Nothing calls `setDocker()` in a plain Node-RED image, so `docker`
+stayed false, and a container has no `sudo`: every save failed silently. Settings
+changed in the UI lived in memory only and were gone after the next restart —
+`config.json` had not changed once in five weeks. `saveGraph()` had no container
+branch at all, so graphs were never saved either and every restart emptied every
+chart.
+
+`docker` is now detected from `/.dockerenv`, and under Docker graphs are written
+directly, through a temp file and a rename so a restart mid-write cannot leave a
+truncated `graph.json`. Enable "Save graphs" (`system.save_graph`) to use it.
+
+Verified: a setting changed through the same path the UI uses reached
+`config.json` within the 5 s debounce, and after a restart the forecast chart came
+back from `graph.json` before the first new forecast run.

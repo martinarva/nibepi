@@ -33,7 +33,11 @@ const os = require('os').networkInterfaces();
 const crypto = require('crypto')
 const http = require('http');
 let ts_cloud = Date.now();
-var docker = false;
+// NIBEPI_PATCHED_PERSIST: detect a container by /.dockerenv. Nothing calls setDocker()
+// in a plain Node-RED image, so docker stayed false and every config save went through
+// `sudo mount -o remount,rw /`, which does not exist in a container. The save failed
+// silently: settings changed in the UI lived in memory only and were gone after a restart.
+var docker = require('fs').existsSync('/.dockerenv');
 let exec = child.exec;
 let spawn = child.spawn;
 let model = "";
@@ -96,6 +100,20 @@ const saveGraph = (data) => {
         
     if(config.system===undefined) config.system = {};
     if(config.log===undefined) config.log = {};
+            // NIBEPI_PATCHED_PERSIST: in a container / is writable and there is no sudo, so
+            // the remount below always failed and graphs were never saved. Write directly,
+            // through a temp file so a restart mid-write cannot leave a truncated graph.json.
+            if(docker===true && config.system.readonly!==true && config.system.save_graph===true) {
+                const tmp = path+'/graph.json.tmp';
+                fs.writeFile(tmp, JSON.stringify(data), function(err) {
+                    if(err) return reject(new Error('Error saving graph to disc, write error'));
+                    fs.rename(tmp, path+'/graph.json', function(err) {
+                        if(err) return reject(new Error('Error saving graph to disc, rename error'));
+                        resolve('Graphs saved');
+                    });
+                });
+                return;
+            }
             if(config.system.readonly===true) {
                 exec('sudo mount -o remount,rw /', function(error, stdout, stderr) {
                     if(error) {
