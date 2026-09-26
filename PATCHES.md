@@ -72,3 +72,22 @@ by `C` before replacing with `C2 B0`.
 **8.** `serialport` bumped to `^13.0.0`; `modbus-serial` removed. The latter was
 the only reason the old native toolchain was pulled in at all — it is used only
 by the dead `modbus-*.js` files, which `index.js` never loads.
+
+## index.js — startup reads
+
+**9. The startup read burst** (`NIBEPI_PATCHED_STARTUP_READS`). Whenever the poll
+list is (re)built — at startup and after every core restart — `addRegular()` runs
+for all ~87 configured registers at once, and it used to fire an immediate read for
+each. The pump answers one register at a time (about 1.4 s each), so the queue took
+some two minutes to drain and the reads at the back timed out after 37 s: a burst of
+~37 `No respond from register` lines about 36 s after every start. One of the
+casualties was the single `supply_s1` read that every plugin in
+`node-red-contrib-nibepi` registers on (see its PATCHES.md), which made plugin
+registration after a restart a matter of luck.
+
+Those immediate reads were redundant — the regular poll reads the same registers
+within one cycle anyway. Bulk (re)adds now skip them (`addRegular(address, false)`);
+a single register added from the UI still reads at once.
+
+Measured after a restart: 0 timeouts in the first 75 s (was ~37), and RMU, indoor
+and forecast control all registered within 75 s without the watchdog having to act.

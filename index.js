@@ -355,7 +355,7 @@ if(config.connection!==undefined && config.connection.series!==undefined) {
                                         }
                                         if(regQueue.length===0) {
                                             for (var i = 0; i < config.registers.length; i++) {
-                                                addRegular(config.registers[i]);
+                                                addRegular(config.registers[i], false);
                                             }
                                         }
                                     }
@@ -910,7 +910,7 @@ const decodeRMU = (buf) => {
         if(i===27) address = 10012;*/
     }
 }
-const addRegular = (address) => {
+const addRegular = (address, readNow=true) => {
     if(core!==undefined && core.connected!==undefined && core.connected===true) {
     let regIndex = register.findIndex(regIndex => regIndex.register == address);
     if(register[regIndex]===undefined) return;
@@ -920,8 +920,13 @@ const addRegular = (address) => {
         if(address.toString().charAt(0)=="1") {
             log(config.log.enable,`RMU register not added to regular list, Register: ${address}`,config.log['debug'],"Register");
         } else {
-            // Req data change
-            reqData(address).catch(console.log)
+            // NIBEPI_PATCHED_STARTUP_READS: at startup this runs for all ~87 configured
+            // registers at once, and an immediate read of each jammed the pump's
+            // one-register-at-a-time bus for ~2 minutes; reads queued behind it timed
+            // out, among them the one supply_sN read every plugin registers on. The
+            // regular poll reads these registers within one cycle anyway, so bulk
+            // (re)adds skip it. A single register added from the UI still reads at once.
+            if(readNow===true) reqData(address).catch(console.log)
             regQueue.push(getData(address));
             log(config.log.enable,`Regular register added (${address})`,config.log['info'],"Register");
             core.send({type:"regRegister",data:regQueue});
@@ -931,9 +936,9 @@ const addRegular = (address) => {
         
     }
 } else {
-    setTimeout((data) => {
-        addRegular(data)
-    }, 10000, address);
+    setTimeout((data, now) => {
+        addRegular(data, now)
+    }, 10000, address, readNow);
 }
 }
 const removeRegular = (address) => {
@@ -1163,7 +1168,7 @@ const decodeMessage = (buf) => {
     
     if(regQueue.length===0 && buf[3]===104) {
         for (var i = 0; i < config.registers.length; i++) {
-            addRegular(config.registers[i]);
+            addRegular(config.registers[i], false);
         }
     }
 }
